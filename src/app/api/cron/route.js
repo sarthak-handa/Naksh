@@ -2,22 +2,16 @@
  * API Route: /api/cron
  * THE BRAIN OF NAKSH
  *
- * Triggered every 10 minutes by Vercel Cron.
- * 1. Fetches all active monitored routes
- * 2. Calls Google Routes API for current ETA
- * 3. Runs the threshold engine (with anti-spam cooldown)
- * 4. Sends push notifications when thresholds are crossed
- * 5. Logs alerts to history
+ * Triggered daily by Vercel Cron (on Hobby tier).
+ * Fetches active routes and runs the threshold engine using the active routing provider.
  */
 import { NextResponse } from "next/server";
 import { supabase } from "@/lib/supabase";
-import { getRouteETA, formatDuration } from "@/lib/google-routes";
+import { getRouteEta, formatDuration } from "@/lib/routing-provider";
 import { sendPushToAll } from "@/lib/push-service";
 
 // Cooldown duration in minutes — after triggering, don't re-trigger for this long
 const COOLDOWN_MINUTES = 30;
-// Buffer zone to prevent ping-pong (e.g., threshold is 45, won't re-trigger until ETA is 50+)
-const BUFFER_MINUTES = 5;
 
 export async function GET(request) {
   try {
@@ -28,7 +22,6 @@ export async function GET(request) {
 
     // Allow access if no secret is configured (development) or if secret matches
     if (cronSecret && secret !== cronSecret) {
-      // Also check for Vercel's cron header
       const authHeader = request.headers.get("authorization");
       if (authHeader !== `Bearer ${cronSecret}`) {
         return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
@@ -77,8 +70,8 @@ export async function GET(request) {
           }
         }
 
-        // 3. Get current ETA from Google
-        const { durationMinutes } = await getRouteETA(
+        // 3. Get ETA from the active routing provider
+        const { durationMinutes, provider } = await getRouteEta(
           route.origin,
           route.destination,
           {
@@ -93,9 +86,7 @@ export async function GET(request) {
         let thresholdValue = null;
 
         // 4. THRESHOLD ENGINE
-        // Check "alert below" threshold
         if (route.alert_below && durationMinutes <= route.alert_below) {
-          // Only alert if we were previously above the threshold (or first check)
           if (previousEta === null || previousEta > route.alert_below) {
             shouldAlert = true;
             alertType = "below";
@@ -103,9 +94,7 @@ export async function GET(request) {
           }
         }
 
-        // Check "alert above" threshold
         if (route.alert_above && durationMinutes >= route.alert_above) {
-          // Only alert if we were previously below the threshold (or first check)
           if (previousEta === null || previousEta < route.alert_above) {
             shouldAlert = true;
             alertType = "above";
@@ -120,7 +109,6 @@ export async function GET(request) {
         };
 
         if (shouldAlert) {
-          // Set cooldown to prevent spam
           const cooldownEnd = new Date();
           cooldownEnd.setMinutes(cooldownEnd.getMinutes() + COOLDOWN_MINUTES);
           updateData.cooldown_until = cooldownEnd.toISOString();
@@ -136,7 +124,6 @@ export async function GET(request) {
         if (shouldAlert) {
           alertsTriggered++;
 
-          // Log alert to history
           await supabase.from("alert_history").insert({
             route_id: route.id,
             eta_at_trigger: durationMinutes,
@@ -145,7 +132,6 @@ export async function GET(request) {
             triggered_at: new Date().toISOString(),
           });
 
-          // Get push subscriptions for this user
           const { data: subscriptions } = await supabase
             .from("push_subscriptions")
             .select("*")
@@ -153,24 +139,15 @@ export async function GET(request) {
 
           if (subscriptions && subscriptions.length > 0) {
             const etaFormatted = formatDuration(durationMinutes);
-            const changeText =
-              previousEta !== null
-                ? `(was ${formatDuration(previousEta)})`
-                : "";
-
+            const changeText = previousEta !== null ? `(was ${formatDuration(previousEta)})` : "";
             const emoji = alertType === "below" ? "🟢" : "🔴";
-            const direction =
-              alertType === "below" ? "dropped below" : "rose above";
+            const direction = alertType === "below" ? "dropped below" : "rose above";
 
             await sendPushToAll(subscriptions, {
               title: `${emoji} ETA ${direction} ${thresholdValue} min`,
               body: `${route.origin} → ${route.destination}\nCurrent ETA: ${etaFormatted} ${changeText}`,
               tag: `naksh-route-${route.id}`,
-              data: {
-                routeId: route.id,
-                eta: durationMinutes,
-                alertType,
-              },
+              data: { routeId: route.id, eta: durationMinutes, alertType },
             });
           }
 
@@ -178,6 +155,7 @@ export async function GET(request) {
             id: route.id,
             status: "alerted",
             eta: durationMinutes,
+            provider,
             alertType,
             threshold: thresholdValue,
           });
@@ -186,6 +164,7 @@ export async function GET(request) {
             id: route.id,
             status: "checked",
             eta: durationMinutes,
+            provider,
             previousEta,
           });
         }

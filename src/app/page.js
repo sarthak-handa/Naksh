@@ -1,6 +1,11 @@
 "use client";
 
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useRef } from "react";
+import dynamic from "next/dynamic";
+import { searchLocation, reverseGeocode } from "@/lib/geocoder";
+
+// Dynamically import Map to prevent SSR issues with Leaflet
+const Map = dynamic(() => import("@/components/Map"), { ssr: false });
 
 // ── Utility: Generate a simple user ID (persisted in localStorage) ──
 function getUserId() {
@@ -13,7 +18,6 @@ function getUserId() {
   return id;
 }
 
-// ── Utility: Format time ago ──
 function timeAgo(dateStr) {
   if (!dateStr) return "Never";
   const diff = Date.now() - new Date(dateStr).getTime();
@@ -25,15 +29,34 @@ function timeAgo(dateStr) {
   return `${Math.floor(hours / 24)}d ago`;
 }
 
-// ── Utility: Format duration ──
-function formatDuration(minutes) {
-  if (minutes === null || minutes === undefined) return "—";
-  if (minutes >= 60) {
-    const h = Math.floor(minutes / 60);
-    const m = minutes % 60;
-    return m > 0 ? `${h}h ${m}m` : `${h}h`;
+// ── Utility: Recent Searches ──
+function getRecentSearches() {
+  if (typeof window === "undefined") return [];
+  try {
+    const data = localStorage.getItem("naksh_recent_searches");
+    return data ? JSON.parse(data) : [];
+  } catch (e) {
+    return [];
   }
-  return `${minutes} min`;
+}
+
+function saveRecentSearch(loc) {
+  if (typeof window === "undefined") return;
+  try {
+    let recent = getRecentSearches();
+    // Remove if already exists
+    recent = recent.filter(r => r.name !== loc.name || r.lat !== loc.lat);
+    // Add to front
+    recent.unshift(loc);
+    // Keep max 5
+    if (recent.length > 5) recent.pop();
+    localStorage.setItem("naksh_recent_searches", JSON.stringify(recent));
+  } catch (e) {}
+}
+
+function clearRecentSearches() {
+  if (typeof window === "undefined") return;
+  localStorage.removeItem("naksh_recent_searches");
 }
 
 export default function Home() {
@@ -41,61 +64,51 @@ export default function Home() {
   const [userId, setUserId] = useState(null);
   const [routes, setRoutes] = useState([]);
   const [alerts, setAlerts] = useState([]);
-  const [loading, setLoading] = useState(false);
-  const [pushSupported, setPushSupported] = useState(false);
-  const [pushSubscribed, setPushSubscribed] = useState(false);
-  const [showBanner, setShowBanner] = useState(true);
-  const [toasts, setToasts] = useState([]);
-
+  const [providerInfo, setProviderInfo] = useState(null);
+  
+  // Search & Map State
+  const [origin, setOrigin] = useState(null); // { name, lat, lon }
+  const [destination, setDestination] = useState(null);
+  const [originQuery, setOriginQuery] = useState("");
+  const [destQuery, setDestQuery] = useState("");
+  const [suggestions, setSuggestions] = useState([]);
+  const [activeInput, setActiveInput] = useState(null); // 'origin' | 'dest'
+  const [isSearching, setIsSearching] = useState(false);
+  const [previewRoute, setPreviewRoute] = useState(null); // { durationMinutes, distanceMeters, geometry }
+  const [recentSearches, setRecentSearches] = useState([]);
+  
   // Form state
-  const [origin, setOrigin] = useState("");
-  const [destination, setDestination] = useState("");
-  const [alertBelow, setAlertBelow] = useState("");
-  const [alertAbove, setAlertAbove] = useState("");
-  const [pollInterval, setPollInterval] = useState("10");
+  const [alertBelow, setAlertBelow] = useState("30");
+  const [alertAbove, setAlertAbove] = useState("60");
+  const [pollInterval, setPollInterval] = useState("5");
   const [submitting, setSubmitting] = useState(false);
+  const [checkingRouteId, setCheckingRouteId] = useState(null);
 
-  // ── Toast helper ──
-  const addToast = useCallback((message, type = "success") => {
-    const id = Date.now();
-    setToasts((prev) => [...prev, { id, message, type }]);
-    setTimeout(() => {
-      setToasts((prev) => prev.filter((t) => t.id !== id));
-    }, 4000);
-  }, []);
+  // Debounce ref
+  const searchTimeout = useRef(null);
 
   // ── Initialize ──
   useEffect(() => {
     const id = getUserId();
     setUserId(id);
+    fetch("/api/check").then(res => res.json()).then(data => {
+      if (data.providerInfo) setProviderInfo(data.providerInfo);
+    }).catch(console.error);
 
-    // Check push notification support
-    if ("serviceWorker" in navigator && "PushManager" in window) {
-      setPushSupported(true);
-      // Check existing subscription
-      navigator.serviceWorker.ready.then((reg) => {
-        reg.pushManager.getSubscription().then((sub) => {
-          if (sub) setPushSubscribed(true);
-        });
-      });
-    }
+    setRecentSearches(getRecentSearches());
 
-    // Register service worker
     if ("serviceWorker" in navigator) {
       navigator.serviceWorker.register("/sw.js").catch(console.error);
     }
   }, []);
 
-  // ── Fetch data ──
   const fetchRoutes = useCallback(async () => {
     if (!userId) return;
     try {
       const res = await fetch(`/api/routes?userId=${userId}`);
       const data = await res.json();
       if (data.routes) setRoutes(data.routes);
-    } catch (err) {
-      console.error("Error fetching routes:", err);
-    }
+    } catch (err) {}
   }, [userId]);
 
   const fetchAlerts = useCallback(async () => {
@@ -104,65 +117,153 @@ export default function Home() {
       const res = await fetch(`/api/alerts?userId=${userId}&limit=10`);
       const data = await res.json();
       if (data.alerts) setAlerts(data.alerts);
-    } catch (err) {
-      console.error("Error fetching alerts:", err);
-    }
+    } catch (err) {}
   }, [userId]);
 
   useEffect(() => {
     if (userId) {
       fetchRoutes();
       fetchAlerts();
-      // Auto-refresh every 60 seconds
       const interval = setInterval(() => {
+        routes.filter(r => r.status === "active").forEach(r => checkRoute(r.id, true));
         fetchRoutes();
         fetchAlerts();
       }, 60000);
       return () => clearInterval(interval);
     }
-  }, [userId, fetchRoutes, fetchAlerts]);
+  }, [userId, fetchRoutes, fetchAlerts, routes]);
 
-  // ── Subscribe to push notifications ──
-  const subscribePush = async () => {
-    try {
-      const registration = await navigator.serviceWorker.ready;
-      const vapidKey = process.env.NEXT_PUBLIC_VAPID_PUBLIC_KEY;
+  // ── Geocoding & Search ──
+  const handleSearch = (query, type) => {
+    if (type === 'origin') setOriginQuery(query);
+    else setDestQuery(query);
+    setActiveInput(type);
+    
+    if (query.trim().length < 2) {
+      setSuggestions([]);
+      return;
+    }
 
-      if (!vapidKey) {
-        addToast("Push notifications not configured yet", "error");
-        return;
+    if (searchTimeout.current) clearTimeout(searchTimeout.current);
+    
+    searchTimeout.current = setTimeout(async () => {
+      setIsSearching(true);
+      const results = await searchLocation(query);
+      setSuggestions(results);
+      setIsSearching(false);
+    }, 400); // 400ms debounce
+  };
+
+  const selectLocation = (loc) => {
+    saveRecentSearch(loc);
+    setRecentSearches(getRecentSearches());
+    
+    if (activeInput === 'origin') {
+      setOrigin(loc);
+      setOriginQuery(loc.name);
+    } else {
+      setDestination(loc);
+      setDestQuery(loc.name);
+    }
+    setSuggestions([]);
+    setActiveInput(null);
+  };
+
+  const handleKeyDown = (e, type) => {
+    if (e.key === 'Enter') {
+      e.preventDefault();
+      if (suggestions.length > 0) {
+        selectLocation(suggestions[0]);
       }
-
-      const subscription = await registration.pushManager.subscribe({
-        userVisibleOnly: true,
-        applicationServerKey: urlBase64ToUint8Array(vapidKey),
-      });
-
-      // Send subscription to backend
-      await fetch("/api/subscribe", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          userId,
-          subscription: subscription.toJSON(),
-        }),
-      });
-
-      setPushSubscribed(true);
-      setShowBanner(false);
-      addToast("🔔 Push notifications enabled!");
-    } catch (err) {
-      console.error("Push subscription error:", err);
-      addToast("Failed to enable notifications. Check permissions.", "error");
+    } else if (e.key === 'Escape') {
+      setActiveInput(null);
     }
   };
 
-  // ── Create a new monitored route ──
+  const useMyLocation = () => {
+    if (!navigator.geolocation) {
+      alert("Geolocation is not supported by your browser");
+      return;
+    }
+    setActiveInput('origin');
+    setIsSearching(true);
+    navigator.geolocation.getCurrentPosition(
+      async (pos) => {
+        const { latitude, longitude } = pos.coords;
+        const result = await reverseGeocode(latitude, longitude);
+        if (result) {
+          selectLocation(result);
+        } else {
+          selectLocation({ name: "Current Location", address: `${latitude.toFixed(4)}, ${longitude.toFixed(4)}`, lat: latitude, lon: longitude });
+        }
+        setIsSearching(false);
+      },
+      (err) => {
+        alert("Could not get your location");
+        setIsSearching(false);
+      }
+    );
+  };
+
+  const swapLocations = () => {
+    const tempOrigin = origin;
+    const tempOriginQuery = originQuery;
+    setOrigin(destination);
+    setOriginQuery(destQuery);
+    setDestination(tempOrigin);
+    setDestQuery(tempOriginQuery);
+  };
+
+  // ── Preview Route ──
+  useEffect(() => {
+    async function getPreview() {
+      if (origin && destination) {
+        try {
+          const coordsString = `${origin.lon},${origin.lat};${destination.lon},${destination.lat}`;
+          const url = `https://router.project-osrm.org/route/v1/driving/${coordsString}?overview=full&geometries=geojson`;
+          const res = await fetch(url);
+          const data = await res.json();
+          if (data.routes && data.routes.length > 0) {
+            setPreviewRoute({
+              durationMinutes: Math.round(data.routes[0].duration / 60),
+              distanceMeters: data.routes[0].distance,
+              geometry: data.routes[0].geometry
+            });
+          }
+        } catch (err) {
+          console.error("Preview error", err);
+        }
+      } else {
+        setPreviewRoute(null);
+      }
+    }
+    getPreview();
+  }, [origin, destination]);
+
+  // ── Create Route ──
   const handleSubmit = async (e) => {
     e.preventDefault();
-    if (!origin || !destination || (!alertBelow && !alertAbove)) {
-      addToast("Fill in origin, destination, and at least one threshold", "error");
-      return;
+    if (!origin || !destination) return;
+    
+    // Request push notification permission
+    if ("serviceWorker" in navigator && "PushManager" in window) {
+      try {
+        const reg = await navigator.serviceWorker.ready;
+        let sub = await reg.pushManager.getSubscription();
+        if (!sub) {
+          sub = await reg.pushManager.subscribe({
+            userVisibleOnly: true,
+            applicationServerKey: urlBase64ToUint8Array(process.env.NEXT_PUBLIC_VAPID_PUBLIC_KEY),
+          });
+          await fetch("/api/subscribe", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ userId, subscription: sub.toJSON() }),
+          });
+        }
+      } catch (err) {
+        console.error("Push auth failed", err);
+      }
     }
 
     setSubmitting(true);
@@ -171,446 +272,255 @@ export default function Home() {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          userId,
-          origin,
-          destination,
-          alertBelow: alertBelow || null,
+          userId, 
+          origin: origin.name, 
+          destination: destination.name,
+          originPlaceId: `${origin.lat},${origin.lon}`,
+          destPlaceId: `${destination.lat},${destination.lon}`,
+          alertBelow: alertBelow || null, 
           alertAbove: alertAbove || null,
-          pollInterval,
+          pollInterval
         }),
       });
 
-      const data = await res.json();
       if (res.ok) {
-        addToast("🚗 Route monitoring started!");
-        setOrigin("");
-        setDestination("");
-        setAlertBelow("");
-        setAlertAbove("");
+        setOrigin(null); setDestination(null);
+        setOriginQuery(""); setDestQuery("");
+        setPreviewRoute(null);
         fetchRoutes();
       } else {
-        addToast(data.error || "Failed to create route", "error");
+        alert("Failed to start monitoring");
       }
     } catch (err) {
-      addToast("Network error. Please try again.", "error");
+      alert("Network error.");
     } finally {
       setSubmitting(false);
     }
   };
 
-  // ── Delete a route ──
-  const deleteRoute = async (id) => {
+  const checkRoute = async (routeId, isSilent = false) => {
+    if (!isSilent) setCheckingRouteId(routeId);
     try {
-      await fetch(`/api/routes?id=${id}`, { method: "DELETE" });
-      addToast("Route removed");
-      fetchRoutes();
-    } catch (err) {
-      addToast("Failed to remove route", "error");
-    }
-  };
-
-  // ── Pause/Resume a route ──
-  const toggleRoute = async (id, currentStatus) => {
-    const newStatus = currentStatus === "active" || currentStatus === "cooldown"
-      ? "paused"
-      : "active";
-    try {
-      await fetch("/api/routes", {
-        method: "PATCH",
+      await fetch("/api/check", {
+        method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ id, status: newStatus, cooldownUntil: null }),
+        body: JSON.stringify({ routeId }),
       });
-      addToast(newStatus === "paused" ? "⏸ Route paused" : "▶ Route resumed");
       fetchRoutes();
-    } catch (err) {
-      addToast("Failed to update route", "error");
+      fetchAlerts();
+    } finally {
+      if (!isSilent) setCheckingRouteId(null);
     }
   };
 
-  // ── Threshold bar calculation ──
-  const getThresholdPercent = (route) => {
-    if (route.last_eta === null) return 50;
-    const min = Math.min(route.alert_below || 0, route.last_eta) - 10;
-    const max = Math.max(route.alert_above || 120, route.last_eta) + 10;
-    const range = max - min;
-    return Math.max(0, Math.min(100, ((route.last_eta - min) / range) * 100));
+  const toggleRoute = async (id, currentStatus) => {
+    const newStatus = currentStatus === "active" || currentStatus === "cooldown" ? "paused" : "active";
+    await fetch("/api/routes", {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ id, status: newStatus, cooldownUntil: null }),
+    });
+    fetchRoutes();
   };
 
+  const deleteRoute = async (id) => {
+    await fetch(`/api/routes?id=${id}`, { method: "DELETE" });
+    fetchRoutes();
+  };
+
+  const activeRoute = routes.find(r => r.status === "active" || r.status === "cooldown");
+  const displayOrigin = origin ? [origin.lat, origin.lon] : 
+                        (activeRoute && activeRoute.origin_place_id ? activeRoute.origin_place_id.split(',').map(Number) : null);
+  const displayDest = destination ? [destination.lat, destination.lon] : 
+                      (activeRoute && activeRoute.dest_place_id ? activeRoute.dest_place_id.split(',').map(Number) : null);
+  
   return (
-    <div className="app-container">
-      {/* ── Header ── */}
-      <header className="app-header animate-fade-in">
-        <div className="app-logo">
-          <div className="app-logo-icon">🛣️</div>
-          <div>
-            <h1>Naksh</h1>
-            <div className="app-logo-subtitle">ETA Monitor</div>
-          </div>
-        </div>
-        <div className="header-actions">
-          {pushSupported && !pushSubscribed && (
-            <button className="btn btn-primary btn-sm" onClick={subscribePush}>
-              🔔 Enable Alerts
-            </button>
-          )}
-          {pushSubscribed && (
-            <span className="status-badge watching">Notifications On</span>
-          )}
-        </div>
-      </header>
+    <div className="map-app-container">
+      {/* ── Background Map ── */}
+      <div className="map-background">
+        <Map 
+          origin={displayOrigin} 
+          destination={displayDest} 
+          routeGeoJSON={previewRoute?.geometry} 
+        />
+      </div>
 
-      {/* ── Notification Permission Banner ── */}
-      {pushSupported && !pushSubscribed && showBanner && (
-        <div className="notification-banner animate-slide-up">
-          <div className="notification-banner-text">
-            <span className="icon">🔔</span>
-            <p>
-              <strong>Enable push notifications</strong> to get ETA alerts
-              directly on your phone — even when this tab is closed.
-            </p>
-          </div>
-          <div style={{ display: "flex", gap: "8px" }}>
-            <button className="btn btn-primary btn-sm" onClick={subscribePush}>
-              Allow Notifications
-            </button>
-            <button
-              className="btn btn-ghost btn-sm"
-              onClick={() => setShowBanner(false)}
-            >
-              Later
-            </button>
-          </div>
-        </div>
-      )}
-
-      {/* ── Main Grid ── */}
-      <div className="main-grid">
-        {/* ── Route Setup Panel ── */}
-        <div className="glass-card animate-slide-up">
-          <div className="glass-card-header">
-            <div className="glass-card-title">
-              <span className="icon">📍</span>
-              New Route Monitor
-            </div>
+      {/* ── Foreground UI ── */}
+      <div className="map-ui-layer">
+        
+        {/* TOP PANEL: Logo & Search */}
+        <div className="map-top-panel">
+          <div className="floating-card logo-card">
+            <h1>Naksh <span className="subtitle">ETA MONITOR</span></h1>
+            {providerInfo && <div className="provider-badge">{providerInfo.name} Provider</div>}
           </div>
 
-          <form onSubmit={handleSubmit}>
-            <div className="form-group">
-              <label className="form-label">Origin</label>
-              <input
-                type="text"
-                className="form-input"
-                placeholder="e.g. Connaught Place, New Delhi"
-                value={origin}
-                onChange={(e) => setOrigin(e.target.value)}
-              />
-            </div>
-
-            <div className="form-group">
-              <label className="form-label">Destination</label>
-              <input
-                type="text"
-                className="form-input"
-                placeholder="e.g. Cyber Hub, Gurugram"
-                value={destination}
-                onChange={(e) => setDestination(e.target.value)}
-              />
-            </div>
-
-            <div className="divider" />
-
-            <div className="form-group">
-              <label className="form-label">Alert Thresholds</label>
-              <div className="form-row">
-                <div className="form-input-with-unit">
-                  <input
-                    type="number"
-                    className="form-input"
-                    placeholder="e.g. 45"
-                    value={alertBelow}
-                    onChange={(e) => setAlertBelow(e.target.value)}
-                    min="1"
-                  />
-                  <span className="form-input-unit">min ↓</span>
-                </div>
-                <div className="form-input-with-unit">
-                  <input
-                    type="number"
-                    className="form-input"
-                    placeholder="e.g. 60"
-                    value={alertAbove}
-                    onChange={(e) => setAlertAbove(e.target.value)}
-                    min="1"
-                  />
-                  <span className="form-input-unit">min ↑</span>
-                </div>
+          <div className="floating-card search-card">
+            <div className="search-inputs">
+              <div className="input-row">
+                <span className="icon-origin">📍</span>
+                <input 
+                  type="text" 
+                  placeholder="From (e.g. Home, Cyber Hub)" 
+                  value={originQuery}
+                  onChange={(e) => handleSearch(e.target.value, 'origin')}
+                  onFocus={() => {
+                    setActiveInput('origin');
+                    if (originQuery.trim().length < 2) setSuggestions([]);
+                  }}
+                  onKeyDown={(e) => handleKeyDown(e, 'origin')}
+                />
+                <button className="location-btn" onClick={useMyLocation} title="Use my location">🎯</button>
               </div>
-              <div
-                style={{
-                  fontSize: "0.75rem",
-                  color: "var(--text-tertiary)",
-                  marginTop: "6px",
-                }}
-              >
-                Alert when ETA drops below ↓ or rises above ↑
+              
+              <div className="swap-row">
+                <button className="swap-btn" onClick={swapLocations} title="Swap origin and destination">⇅</button>
+                <div className="vertical-line"></div>
+              </div>
+
+              <div className="input-row">
+                <span className="icon-dest">●</span>
+                <input 
+                  type="text" 
+                  placeholder="To (e.g. Office, Badkal Mor)" 
+                  value={destQuery}
+                  onChange={(e) => handleSearch(e.target.value, 'dest')}
+                  onFocus={() => {
+                    setActiveInput('dest');
+                    if (destQuery.trim().length < 2) setSuggestions([]);
+                  }}
+                  onKeyDown={(e) => handleKeyDown(e, 'dest')}
+                />
               </div>
             </div>
 
-            <div className="form-group">
-              <label className="form-label">Check Every</label>
-              <select
-                className="form-select"
-                value={pollInterval}
-                onChange={(e) => setPollInterval(e.target.value)}
-              >
-                <option value="5">5 minutes</option>
-                <option value="10">10 minutes</option>
-                <option value="15">15 minutes</option>
-                <option value="30">30 minutes</option>
-              </select>
-            </div>
-
-            <button
-              type="submit"
-              className={`btn btn-monitor ${submitting ? "active" : ""}`}
-              disabled={submitting}
-            >
-              <span className="btn-text">
-                {submitting ? (
-                  <>
-                    <span className="spinner" style={{ display: "inline-block" }} />
-                    Starting...
-                  </>
+            {/* Suggestions Dropdown */}
+            {activeInput && (suggestions.length > 0 || isSearching || (recentSearches.length > 0 && ((activeInput === 'origin' && originQuery.trim().length < 2) || (activeInput === 'dest' && destQuery.trim().length < 2)))) && (
+              <div className="suggestions-dropdown">
+                {isSearching ? (
+                  <div className="suggestion-item loading">Searching globally...</div>
+                ) : suggestions.length > 0 ? (
+                  suggestions.map((loc, i) => (
+                    <div key={i} className="suggestion-item" onClick={() => selectLocation(loc)}>
+                      <div className="sugg-name">
+                        <span className="sugg-icon">📍</span> {loc.name}
+                      </div>
+                      <div className="sugg-address">{loc.address}</div>
+                    </div>
+                  ))
                 ) : (
-                  "🚀 Start Monitoring"
+                  <>
+                    <div className="recent-header">
+                      <span>Recent</span>
+                      <button onClick={() => { clearRecentSearches(); setRecentSearches([]); }} className="btn-clear-recent">Clear</button>
+                    </div>
+                    {recentSearches.map((loc, i) => (
+                      <div key={`recent_${i}`} className="suggestion-item" onClick={() => selectLocation(loc)}>
+                        <div className="sugg-name">
+                          <span className="sugg-icon">🕒</span> {loc.name}
+                        </div>
+                        <div className="sugg-address">{loc.address}</div>
+                      </div>
+                    ))}
+                  </>
                 )}
-              </span>
-            </button>
-          </form>
+                {!isSearching && suggestions.length === 0 && recentSearches.length === 0 && (
+                  <div className="suggestion-item loading">No places found</div>
+                )}
+              </div>
+            )}
+          </div>
         </div>
 
-        {/* ── Live Monitor Panel ── */}
-        <div className="glass-card animate-slide-up" style={{ animationDelay: "0.1s" }}>
-          <div className="glass-card-header">
-            <div className="glass-card-title">
-              <span className="icon">📡</span>
-              Active Monitors
-            </div>
-            <span
-              style={{
-                fontSize: "0.75rem",
-                color: "var(--text-tertiary)",
-                fontFamily: "'JetBrains Mono', monospace",
-              }}
-            >
-              {routes.length} active
-            </span>
-          </div>
-
-          {routes.length === 0 ? (
-            <div className="empty-state">
-              <div className="icon">🛣️</div>
-              <p>No routes being monitored yet. Create one to get started.</p>
-            </div>
-          ) : (
-            <div style={{ maxHeight: "500px", overflowY: "auto" }}>
-              {routes.map((route) => (
-                <div key={route.id} className="route-card">
-                  <div className="route-card-header">
-                    <div>
-                      <div className="route-card-title">
-                        {route.origin}
-                        <span style={{ color: "var(--accent-cyan)", margin: "0 8px" }}>→</span>
-                        {route.destination}
-                      </div>
-                      <div className="route-card-subtitle">
-                        Checked {timeAgo(route.last_checked)}
-                      </div>
-                    </div>
-                    <span className={`status-badge ${route.status}`}>
-                      {route.status}
-                    </span>
-                  </div>
-
-                  {/* ETA Display */}
-                  {route.last_eta !== null && (
-                    <div className="eta-display">
-                      <div className="eta-number">{route.last_eta}</div>
-                      <div className="eta-unit">minutes</div>
-                    </div>
-                  )}
-
-                  {/* Threshold Bar */}
-                  {route.last_eta !== null && (
-                    <div className="threshold-bar-container">
-                      <div className="threshold-bar-labels">
-                        <span>
-                          {route.alert_below ? `↓ ${route.alert_below}m` : ""}
-                        </span>
-                        <span>
-                          {route.alert_above ? `↑ ${route.alert_above}m` : ""}
-                        </span>
-                      </div>
-                      <div className="threshold-bar">
-                        <div
-                          className="threshold-bar-fill"
-                          style={{ width: `${getThresholdPercent(route)}%` }}
-                        />
-                        <div
-                          className="threshold-bar-marker"
-                          style={{ left: `${getThresholdPercent(route)}%` }}
-                        />
-                        {route.alert_below && (
-                          <div
-                            className="threshold-line"
-                            style={{
-                              left: `${
-                                ((route.alert_below -
-                                  (Math.min(
-                                    route.alert_below || 0,
-                                    route.last_eta
-                                  ) -
-                                    10)) /
-                                  (Math.max(
-                                    route.alert_above || 120,
-                                    route.last_eta
-                                  ) +
-                                    10 -
-                                    (Math.min(
-                                      route.alert_below || 0,
-                                      route.last_eta
-                                    ) -
-                                      10))) *
-                                100
-                              }%`,
-                            }}
-                          />
-                        )}
-                      </div>
-                    </div>
-                  )}
-
-                  {/* Meta info */}
-                  <div className="route-card-meta">
-                    <div className="route-card-meta-item">
-                      <span className="route-card-meta-label">Alert Below</span>
-                      <span className="route-card-meta-value">
-                        {route.alert_below ? `${route.alert_below}m` : "—"}
-                      </span>
-                    </div>
-                    <div className="route-card-meta-item">
-                      <span className="route-card-meta-label">Alert Above</span>
-                      <span className="route-card-meta-value">
-                        {route.alert_above ? `${route.alert_above}m` : "—"}
-                      </span>
-                    </div>
-                    <div className="route-card-meta-item">
-                      <span className="route-card-meta-label">Interval</span>
-                      <span className="route-card-meta-value">
-                        {route.poll_interval}m
-                      </span>
-                    </div>
-                  </div>
-
-                  {/* Actions */}
-                  <div
-                    style={{
-                      display: "flex",
-                      gap: "8px",
-                      marginTop: "16px",
-                    }}
-                  >
-                    <button
-                      className="btn btn-ghost btn-sm"
-                      onClick={() => toggleRoute(route.id, route.status)}
-                    >
-                      {route.status === "paused" ? "▶ Resume" : "⏸ Pause"}
-                    </button>
-                    <button
-                      className="btn btn-danger btn-sm"
-                      onClick={() => deleteRoute(route.id)}
-                    >
-                      🗑 Remove
-                    </button>
-                  </div>
+        {/* BOTTOM PANELS */}
+        <div className="map-bottom-panels">
+          {/* SETUP MODE: Route Preview & Alert Config */}
+          {previewRoute && !activeRoute && (
+            <div className="floating-card route-preview-card animate-slide-up">
+              <div className="route-preview-header">
+                <div className="route-time">{previewRoute.durationMinutes} min</div>
+                <div className="route-dist">{(previewRoute.distanceMeters / 1000).toFixed(1)} km</div>
+              </div>
+              <div className="route-disclaimer">Base driving estimate (Traffic data unavailable via OSRM)</div>
+              
+              <form onSubmit={handleSubmit} className="alert-config-form">
+                <div className="config-row">
+                  <label>Alert below:</label>
+                  <input type="number" value={alertBelow} onChange={e => setAlertBelow(e.target.value)} /> min
                 </div>
-              ))}
+                <div className="config-row">
+                  <label>Alert above:</label>
+                  <input type="number" value={alertAbove} onChange={e => setAlertAbove(e.target.value)} /> min
+                </div>
+                <button type="submit" className="btn-start-monitor" disabled={submitting}>
+                  {submitting ? "Starting..." : "🔔 Start Monitoring"}
+                </button>
+              </form>
+            </div>
+          )}
+
+          {/* ACTIVE MONITOR MODE */}
+          {activeRoute && (
+            <div className="floating-card active-monitor-card animate-slide-up">
+              <div className="monitor-status">
+                <span className={`status-dot ${activeRoute.status}`}></span>
+                {activeRoute.status === "paused" ? "Paused" : "Monitoring"}
+              </div>
+              
+              <div className="monitor-locations">
+                <div className="loc-origin">📍 {activeRoute.origin}</div>
+                <div className="loc-dest">● {activeRoute.destination}</div>
+              </div>
+
+              <div className="monitor-eta-section">
+                <div className="eta-display">
+                  <span className="eta-val">{activeRoute.last_eta || "--"}</span>
+                  <span className="eta-unit">min</span>
+                </div>
+                <div className="eta-meta">
+                  Checked: {timeAgo(activeRoute.last_checked)}<br/>
+                  Alerts: &lt;{activeRoute.alert_below || '-'} &gt;{activeRoute.alert_above || '-'}
+                </div>
+              </div>
+
+              <div className="monitor-actions">
+                <button className="btn-action" onClick={() => checkRoute(activeRoute.id)} disabled={checkingRouteId === activeRoute.id}>
+                  {checkingRouteId === activeRoute.id ? "Checking..." : "⚡ Check Now"}
+                </button>
+                <button className="btn-action" onClick={() => toggleRoute(activeRoute.id, activeRoute.status)}>
+                  {activeRoute.status === "paused" ? "▶ Resume" : "⏸ Pause"}
+                </button>
+                <button className="btn-action danger" onClick={() => deleteRoute(activeRoute.id)}>
+                  🗑 Stop
+                </button>
+              </div>
+            </div>
+          )}
+
+          {/* ALERTS HISTORY */}
+          {alerts.length > 0 && !previewRoute && (
+            <div className="floating-card history-card">
+              <h3>Alert History</h3>
+              <div className="history-list">
+                {alerts.slice(0,3).map(alert => (
+                  <div key={alert.id} className="history-item">
+                    <span className="hist-icon">{alert.threshold_crossed === 'below' ? '📉' : '📈'}</span>
+                    <div className="hist-text">
+                      ETA {alert.threshold_crossed === 'below' ? 'dropped below' : 'rose above'} {alert.threshold_value}m
+                      <div className="hist-time">{timeAgo(alert.triggered_at)}</div>
+                    </div>
+                  </div>
+                ))}
+              </div>
             </div>
           )}
         </div>
-      </div>
 
-      {/* ── Alert History ── */}
-      <div className="glass-card animate-slide-up" style={{ animationDelay: "0.2s" }}>
-        <div className="glass-card-header">
-          <div className="glass-card-title">
-            <span className="icon">🔔</span>
-            Alert History
-          </div>
-        </div>
-
-        {alerts.length === 0 ? (
-          <div className="empty-state">
-            <div className="icon">📭</div>
-            <p>No alerts triggered yet. They'll appear here when your ETA thresholds are crossed.</p>
-          </div>
-        ) : (
-          <div className="alert-timeline">
-            {alerts.map((alert) => (
-              <div key={alert.id} className="alert-item">
-                <div
-                  className={`alert-icon ${alert.threshold_crossed}`}
-                >
-                  {alert.threshold_crossed === "below" ? "📉" : "📈"}
-                </div>
-                <div className="alert-content">
-                  <div className="alert-message">
-                    ETA{" "}
-                    {alert.threshold_crossed === "below"
-                      ? "dropped below"
-                      : "rose above"}{" "}
-                    <strong>{alert.threshold_value} min</strong>
-                    {" — "}
-                    currently{" "}
-                    <strong
-                      style={{
-                        color:
-                          alert.threshold_crossed === "below"
-                            ? "#00e676"
-                            : "#ff6b6b",
-                      }}
-                    >
-                      {alert.eta_at_trigger} min
-                    </strong>
-                  </div>
-                  {alert.monitored_routes && (
-                    <div className="alert-time">
-                      {alert.monitored_routes.origin} →{" "}
-                      {alert.monitored_routes.destination}
-                      {" · "}
-                      {timeAgo(alert.triggered_at)}
-                    </div>
-                  )}
-                </div>
-              </div>
-            ))}
-          </div>
-        )}
-      </div>
-
-      {/* ── Toast Notifications ── */}
-      <div className="toast-container">
-        {toasts.map((toast) => (
-          <div key={toast.id} className={`toast ${toast.type}`}>
-            {toast.message}
-          </div>
-        ))}
       </div>
     </div>
   );
 }
 
-// ── Helper: Convert VAPID key to Uint8Array ──
 function urlBase64ToUint8Array(base64String) {
   const padding = "=".repeat((4 - (base64String.length % 4)) % 4);
   const base64 = (base64String + padding).replace(/-/g, "+").replace(/_/g, "/");
